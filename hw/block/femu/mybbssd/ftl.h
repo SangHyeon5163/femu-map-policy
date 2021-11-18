@@ -7,10 +7,6 @@
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
 
-#define PAGESIZE 4096
-#define _PME (PAGESIZE/8) // per page mapping entries uint64_t
-#define _PMES 9 // calculate mapping index with unit of pages 
-
 enum {
     NAND_READ =  0,
     NAND_WRITE = 1,
@@ -55,16 +51,6 @@ enum {
 #define PL_BITS     (8)
 #define LUN_BITS    (8)
 #define CH_BITS     (7)
-
-#define MAP_PROT
-//#define FIFO 
-#define LRU
-
-#ifdef MAP_PROT
-#define PROTECTED_RATIO 0.01
-#define DIRTY_BIT_SHIFT 0
-
-#endif
 
 /* describe a physical page addr */
 struct ppa {
@@ -155,11 +141,6 @@ struct ssdparams {
     int pgs_per_ch;   /* # of pages per channel */
     int tt_pgs;       /* total # of pages in the SSD */
 
-#ifdef MAP_PROT
-	int pgs_maptbl; /* # of pages in the maptbl */ 
-	int pgs_protected; /* # of pages in the protected maptbl */
-#endif 
-
     int blks_per_lun; /* # of blocks per LUN */
     int blks_per_ch;  /* # of blocks per channel */
     int tt_blks;      /* total # of blocks in the SSD */
@@ -213,31 +194,12 @@ struct nand_cmd {
     int64_t stime; /* Coperd: request arrival time */
 };
 
-#ifdef MAP_PROT
-struct dmpg_node { /* dirty maptbl pg node */ 
-	uint64_t idx;
-	struct dmpg_node *prev; 
-	struct dmpg_node *next; 
-}; 
-#endif 
-
 struct ssd {
     char *ssdname;
     struct ssdparams sp;
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
- 
-#ifdef MAP_PROT
-	int tt_maptbl_dpg; 
-	int tt_maptbl_flush; // number of flushes
-	// int tt_maptbl_flush_pgs // number of flushed pages
-	int *maptbl_state; // checked mapping table's dirty condition
-	struct dmpg_node *dmpg_list; 
-	struct dmpg_node *dmpg_list_tail; 
-	struct ppa *gtd; /* page level meta mapping table */
-#endif
-
-	uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
+    uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;
 

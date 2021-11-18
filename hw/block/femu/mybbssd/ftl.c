@@ -1,8 +1,6 @@
 #include "ftl.h"
-int tt_acc = 0; 
-int hit_acc = 0;
 
-#define FEMU_DEBUG_FTL
+//#define FEMU_DEBUG_FTL
 
 static void *ftl_thread(void *arg);
 
@@ -21,31 +19,11 @@ static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
     return ssd->maptbl[lpn];
 }
 
-#ifdef MAP_PROT
-static inline struct ppa get_gtd_ent(struct ssd *ssd, uint64_t gidx)
-{
-	return ssd->gtd[gidx]; 
-}
-
-static inline void set_gtd_ent(struct ssd *ssd, uint64_t gidx, struct ppa *ppa)
-{ 
-	ssd->gtd[gidx] = *ppa; 
-} 
-#endif 
-
 static inline void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa)
 {
     ftl_assert(lpn < ssd->sp.tt_pgs);
     ssd->maptbl[lpn] = *ppa;
 }
-
-#ifdef MAP_PROT
-static uint64_t get_mpg_idx(uint64_t lba)
-{
-	/* find index on map table page associated with lpn */ 
-	return lba >> _PMES;
-}
-#endif 
 
 static uint64_t ppa2pgidx(struct ssd *ssd, struct ppa *ppa)
 {
@@ -282,10 +260,6 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->pgs_per_lun = spp->pgs_per_pl * spp->pls_per_lun;
     spp->pgs_per_ch = spp->pgs_per_lun * spp->luns_per_ch;
     spp->tt_pgs = spp->pgs_per_ch * spp->nchs;
-#ifdef MAP_PROT
-	spp->pgs_maptbl = spp->tt_pgs / _PME; 
-	spp->pgs_protected = spp->pgs_maptbl * PROTECTED_RATIO; 
-#endif 
 
     spp->blks_per_lun = spp->blks_per_pl * spp->pls_per_lun;
     spp->blks_per_ch = spp->blks_per_lun * spp->luns_per_ch;
@@ -374,30 +348,7 @@ static void ssd_init_maptbl(struct ssd *ssd)
     for (int i = 0; i < spp->tt_pgs; i++) {
         ssd->maptbl[i].ppa = UNMAPPED_PPA;
     }
-	//ftl_log("spp->tt_pgs: %d\n", spp->tt_pgs);
-	//ftl_log("ppa size: %ld\n", sizeof(struct ppa)); 
-
-#ifdef MAP_PROT
-	ssd->maptbl_state = g_malloc0(sizeof(int) * spp->pgs_maptbl); 
-
-	ssd->dmpg_list = NULL; 
-	ssd->dmpg_list_tail = NULL; 
-	ssd->tt_maptbl_dpg = 0;
-	ssd->tt_maptbl_flush = 0; 
-#endif
 }
-
-#ifdef MAP_PROT
-static void ssd_init_gtd(struct ssd *ssd)
-{ 
-	struct ssdparams *spp = &ssd->sp; 
-
-	ssd->gtd = g_malloc0(sizeof(struct ppa) * spp->pgs_maptbl); 
-	for (int i = 0; i < spp->pgs_maptbl; i++) { 
-		ssd->gtd[i].ppa = UNMAPPED_PPA; 
-	} 
-} 
-#endif
 
 static void ssd_init_rmap(struct ssd *ssd)
 {
@@ -426,11 +377,6 @@ void ssd_init(FemuCtrl *n)
 
     /* initialize maptbl */
     ssd_init_maptbl(ssd);
-
-#ifdef MAP_PROT
-	/* initialize gtd */ 
-	ssd_init_gtd(ssd); 
-#endif
 
     /* initialize rmap */
     ssd_init_rmap(ssd);
@@ -857,166 +803,6 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     return maxlat;
 }
 
-#ifdef MAP_PROT
-/* This function sets the maptbl page dirty and flushes maptbl
- * if the number of dirty maptbl pages exceeds the protected number */ 
-static void add_to_dirty_mpg_list(struct ssd *ssd, uint64_t fidx)
-{
-	struct dmpg_node *nn = g_malloc0(sizeof(struct dmpg_node)); 
-
-	nn->idx = fidx; 
-	nn->prev = NULL; 
-
-	if (!ssd->dmpg_list && !ssd->dmpg_list_tail) { 
-		ssd->dmpg_list = nn; 
-		ssd->dmpg_list_tail = nn; 
-	} else { 
-		nn->next = ssd->dmpg_list; 
-		ssd->dmpg_list->prev = nn; 
-		ssd->dmpg_list = nn; 
-	} 
-
-	return; 
-}
-
-static uint64_t set_maptbl_pg_dirty(struct ssd *ssd, uint64_t lba)
-{ 
-	struct ssdparams *spp = &ssd->sp; 
-#ifdef LRU
-	struct dmpg_node *prev, *next; 
-#endif
-	uint64_t idx = get_mpg_idx(lba); 
-	uint64_t curlat = 0, maxlat = 0; 
-	int r; 
-
-	//ftl_log("lba %ld\n", idx);
-	tt_acc++; 
-#ifdef FIFO
-	/* Nothing to do if maptbl page is dirty */
-	if (ssd->maptbl_state[idx] & (1 << DIRTY_BIT_SHIFT)) { 
-		hit_acc++; 
-		return 0; 
-	} 
-
-	/* set the maptbl pg dirty */
-	ssd->maptbl_state[idx] |= (1 << DIRTY_BIT_SHIFT); 
-
-	/* add to dirty maptbl page list */
-	add_to_dirty_mpg_list(ssd, idx); 
-
-#endif 
-#ifdef LRU
-	/* list update if maptbl page is dirty */ 
-	if (ssd->maptbl_state[idx] & (1 << DIRTY_BIT_SHIFT)) { 
-		struct dmpg_node *tmp = ssd->dmpg_list; 
-		hit_acc++;
-		while (!tmp) { 
-			if (tmp->idx == idx)
-				break; 
-
-			tmp = tmp->next;
-		} 
-
-		if (ssd->dmpg_list == ssd->dmpg_list_tail || !ssd->dmpg_list->prev) { 
-			return 0; 
-		} 
-		
-		if (!tmp->next) { 
-			prev = tmp->prev; 
-			prev->next = NULL; 
-		} else { 
-			prev = tmp->prev; 
-			next = tmp->next; 
-			prev->next = next; 
-			next->prev = prev; 
-		} 
-
-		tmp->next = ssd->dmpg_list; 
-		ssd->dmpg_list = tmp; 
-
-		return 0; 
-	} 
-
-	/* set the maptbl pg dirty */
-	ssd->maptbl_state[idx] |= (1 << DIRTY_BIT_SHIFT); 
-
-	/* add to dirty maptbl page list */ 
-	add_to_dirty_mpg_list(ssd, idx); 
-
-#endif
-
-	/* increment the number of dirty maptbl pages */ 
-	ssd->tt_maptbl_dpg++; 
-	//ftl_log("total maptbl dirty page: %d\n", ssd->tt_maptbl_dpg);
-
-	/* check the need of mapping table flush */
-	if (ssd->tt_maptbl_dpg >= spp->pgs_protected) { 
-		/* do flush mapping table */
-		//while (ssd->dmpg_list != NULL) { 
-		for (int i = 0; i < 10; i++) {
-			while (should_gc_high(ssd)) { 
-				/* perform GC here until !should_gc(ssd) */ 
-				r = do_gc(ssd, true); 
-				if (r == -1) 
-					break; 
-			} 
-
-			idx = ssd->dmpg_list_tail->idx; 
-			ssd->maptbl_state[idx] &= ~(1 << DIRTY_BIT_SHIFT); 
-
-			struct ppa ppa = get_gtd_ent(ssd, idx); 
-
-			/* update old page information first */
-			if (mapped_ppa(&ppa)) { 
-				mark_page_invalid(ssd, &ppa); 
-				set_rmap_ent(ssd, INVALID_LPN, &ppa); 
-			} 
-			
-			/* new write */
-			ppa = get_new_page(ssd); 
-			/* update gtd */ 
-			set_gtd_ent(ssd, idx, &ppa); 
-			/* update rmap */
-			set_rmap_ent(ssd, idx, &ppa); // we need something params just separate gtd idx.. 
-			
-			mark_page_valid(ssd, &ppa); 
-
-			/* need to advance the write pointer here */ 
-			ssd_advance_write_pointer(ssd); 
-
-			struct nand_cmd swr; 
-			swr.type = USER_IO; 
-			swr.cmd = NAND_WRITE; 
-			swr.stime = 0; 
-
-			/* get latency statistics */ 
-			curlat = ssd_advance_status(ssd, &ppa, &swr); 
-			maxlat = (curlat > maxlat) ? curlat : maxlat; 
-
-			struct dmpg_node *tmp = ssd->dmpg_list_tail; 
-			if (ssd->dmpg_list_tail == ssd->dmpg_list) { 
-				ssd->dmpg_list = NULL; 
-				ssd->dmpg_list_tail = NULL; 
-			} else { 
-				ssd->dmpg_list_tail = ssd->dmpg_list_tail->prev; 
-			} 
-			
-			free(tmp); 
-			
-			ssd->tt_maptbl_dpg--; 
-			ssd->tt_maptbl_flush++; //count uint of page
-//			tt_flush_mpgs++; 
-		} 
-//		ssd->tt_maptbl_dpg = 0;
-//		ssd->tt_maptbl_flush++; 
-//		ssd->tt_maptbl_flush_pgs += tt_flush_mpgs; 
-	}
-	//ftl_log("tt_maptbl_flush: %d\n", ssd->tt_maptbl_flush); 
-
-	return 0; 
-} 
-#endif
-
 static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 {
     uint64_t lba = req->slba;
@@ -1041,8 +827,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-    	ftl_log("lpn: %ld\n", lpn); 
-		ppa = get_maptbl_ent(ssd, lpn);
+        ppa = get_maptbl_ent(ssd, lpn);
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
             mark_page_invalid(ssd, &ppa);
@@ -1053,10 +838,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         ppa = get_new_page(ssd);
         /* update maptbl */
         set_maptbl_ent(ssd, lpn, &ppa);
-		/* update maptbl dirty info */ 
-		set_maptbl_pg_dirty(ssd, lpn);
-		//ftl_log("tt_acc: %d, hit_acc: %d\n", tt_acc, hit_acc); 
-		/* update rmap */
+        /* update rmap */
         set_rmap_ent(ssd, lpn, &ppa);
 
         mark_page_valid(ssd, &ppa);
